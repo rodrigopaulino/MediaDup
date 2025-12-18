@@ -82,7 +82,7 @@ normalize_raster() {
   # args: infile outfile
   local infile="$1"; local outfile="$2"
   if command -v exiftool >/dev/null 2>&1; then
-    exiftool -q -q -all= -overwrite_original -o "$outfile" "$infile" 2>/dev/null || exiftool -q -q -all= -o "$outfile" "$infile"
+    exiftool -q -q -all= -o "$outfile" "$infile"
   else
     # fallback copy (no metadata stripping)
     cp "$infile" "$outfile"
@@ -189,8 +189,8 @@ SQL
 # Worker (invoked as subcommand 'worker')
 # ---------------------------
 worker_main() {
-  # args: cache_db tmpdir file
-  local cache_db="$1"; local tmpbase="$2"; local file="$3"
+  # args: cache_db file
+  local cache_db="$1"; local file="$2"
   if [ ! -f "$file" ]; then echo "__MISSING__|$file"; exit 0; fi
   local size mtime
   if stat --version >/dev/null 2>&1; then
@@ -200,23 +200,18 @@ worker_main() {
   fi
 
   # attempt cache lookup
-  if [ -n "$cache_db" ] && [ -f "$cache_db" ] && command -v sqlite3 >/dev/null 2>&1; then
-    cached=$(sqlite3 "$cache_db" "SELECT hash FROM filehash WHERE path = $(printf '%q' "$file") AND mtime = $mtime AND size = $size LIMIT 1;")
+  if [ -n "$cache_db" ] && [ -f "$cache_db" ]; then
+    cached=$(get_cached_hash "$cache_db" "$file" "$mtime" "$size")
     if [ -n "$cached" ]; then
       echo "$cached|$file"; exit 0
     fi
   fi
 
-  # compute normalized hash
-  local worker_tmp
-  worker_tmp=$(mktemp -d "${tmpbase}/w.XXXX")
-  trap 'rm -rf "$worker_tmp"' RETURN
-
   local result
   result=$(compute_normalized_hash "$file" 2>/dev/null) || result="__ERR__"
   if [ -n "$result" ] && [ "$result" != "__ERR__" ]; then
     # store
-    if [ -n "$cache_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    if [ -n "$cache_db" ]; then
       store_cached_hash "$cache_db" "$file" "$mtime" "$size" "$result" || true
     fi
   fi
@@ -251,18 +246,15 @@ find_duplicates_main() {
   global_tmp=$(mktemp -d "${CACHE_DIR}/global.XXXX")
   local output="${global_tmp}/hashes.txt"; : > "$output"
 
-  # export PROG so worker calls this script
-  export PROG_PATH="$(readlink -f "$0")"
-
   if command -v parallel >/dev/null 2>&1; then
     # use GNU parallel
-    printf "%s\n" "${files[@]}" | parallel --jobs "$jobs" --bar --line-buffer "$PROG_PATH" worker "$cache_db" "$global_tmp" {} > "$output"
+    printf "%s\n" "${files[@]}" | parallel --jobs "$jobs" --bar --line-buffer "$(readlink -f "$0")" worker "$cache_db" {} > "$output"
   else
     # fallback xargs -P
     if command -v pv >/dev/null 2>&1 && [ "$use_pv" -eq 1 ]; then
-      printf "%s\n" "${files[@]}" | pv -N files -s "$total" -l | xargs -I{} -n1 -P "$jobs" bash -c "$PROG_PATH worker \"$cache_db\" \"$global_tmp\" \"{}\"" >> "$output"
+      printf "%s\n" "${files[@]}" | pv -N files -s "$total" -l | xargs -I{} -n1 -P "$jobs" bash -c "$(readlink -f "$0") worker \"$cache_db\" \"{}\"" >> "$output"
     else
-      printf "%s\n" "${files[@]}" | xargs -I{} -n1 -P "$jobs" bash -c "$PROG_PATH worker \"$cache_db\" \"$global_tmp\" \"{}\"" >> "$output"
+      printf "%s\n" "${files[@]}" | xargs -I{} -n1 -P "$jobs" bash -c "$(readlink -f "$0") worker \"$cache_db\" \"{}\"" >> "$output"
     fi
   fi
 
@@ -620,7 +612,7 @@ Usage:
   $PROG compare-pixels <file1> <file2>
   $PROG hash <file>
   $PROG tui
-  $PROG worker <cache_db> <tmpdir> <file>   # internal (used by parallel)
+  $PROG worker <cache_db> <file>   # internal (used by parallel)
 EOF
   exit 1
 fi
