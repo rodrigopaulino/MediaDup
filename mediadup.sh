@@ -65,7 +65,7 @@ if [ ! -f "$THEME_CONF" ]; then default_theme; fi
 load_theme() {
   # Export simple color vars (terminal color codes will be approximated)
   name=$(awk -F= '/^name=/ {print $2}' "$THEME_CONF")
-  export THEME_NAME="$name"
+  THEME_NAME="$name"
 }
 load_theme
 
@@ -517,12 +517,12 @@ ui_view_results() {
 }
 
 ui_theme_choice() {
-  CHOICE=$(dialog --stdout --menu "Pick theme" 15 60 6 \
-    Solarized "Solarized Dark" \
-    Dracula "Dracula" \
-    Nord "Nord" \
-    Classic "Classic Green" \
-    Reset "Reset to default")
+  CHOICE=$(dialog --colors --stdout --menu "Pick theme" 18 78 6 \
+    Solarized "\Z6Calm text\Z0  \Z4highlight\Z0  \Z3accent\Z0" \
+    Dracula "\Z7Midnight text\Z0  \Z2neon highlight\Z0  \Z5magenta pop\Z0" \
+    Nord "\Z7Fjord text\Z0  \Z6frost highlight\Z0  \Z2moss accent\Z0" \
+    Classic "\Z2Retro console\Z0  \Zb\Z2bright prompt\Z0  \Z3amber warn\Z0" \
+    Reset "\Z7Reset to default palette\Z0")
   case "$CHOICE" in
     Solarized)
       cat > "$THEME_CONF" <<'EOF'
