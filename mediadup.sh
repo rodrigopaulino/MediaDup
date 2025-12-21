@@ -266,7 +266,12 @@ find_duplicates_main() {
     case "$hashpart" in
       __ERR__|__MISSING__|__UNSUPPORTED__|NOVIDEO-NOAUDIO) continue ;;
     esac
-    groups["$hashpart"]+=$'\n'"$path"
+
+    if [ -z "${groups[$hashpart]+set}" ]; then
+      groups["$hashpart"]="$path"
+    else
+      groups["$hashpart"]+=$'\n'"$path"
+    fi
   done < "$output"
 
   # Save a JSON-ish results file for dashboard/TUI
@@ -339,8 +344,15 @@ find_duplicates_main() {
 
       # append to results_json: simple line-oriented JSON array
       # we append manual JSON chunk
-      jq -c --arg h "$h" --argjson cnt "${#arr[@]}" --arg keep "${arr[0]}" --argfile files <(printf '%s\n' "${arr[@]}" | jq -R . | jq -s .) \
-        '. + [ {hash:$h, count:$cnt, keep:$keep, files:$files} ]' "$results_json" > "${results_json}.tmp" && mv "${results_json}.tmp" "$results_json" || true
+      if jq -c --arg h "$h" --argjson cnt "${#arr[@]}" --arg keep "${arr[0]}" --argfile files <(printf '%s\n' "${arr[@]}" | jq -R . | jq -s .) \
+        '. + [ {hash:$h, count:$cnt, keep:$keep, files:$files} ]' "$results_json" > "${results_json}.tmp"; then
+        mv "${results_json}.tmp" "$results_json"
+      else
+        log_msg="$(date +'%Y-%m-%d %H:%M:%S')\tFailed to update $results_json for hash $h"
+        err "$log_msg"
+        printf '%s\n' "$log_msg" >> "${CACHE_DIR}/activity.log" || true
+        rm -f "${results_json}.tmp" || true
+      fi
     fi
   done
 
@@ -371,7 +383,7 @@ compare_pixels_cmd() {
   normalize_raster "$f1" "$tmp1"
   normalize_raster "$f2" "$tmp2"
   if command -v compare >/dev/null 2>&1; then
-    out=$(compare -metric RMSE "$tmp1" "$tmp2" null: 2>&1) || out=$out
+    out=$(compare -metric RMSE "$tmp1" "$tmp2" null: 2>&1) || true
     echo "RMSE = $out (0 = identical)"
   else
     err "ImageMagick 'compare' not found."
@@ -421,17 +433,35 @@ pick_file_fzf() {
   echo "$pick"
 }
 
+# shared compare helper for CLI and TUI (prints into provided var names)
+compare_hashes_cmd() {
+  local f1="$1" f2="$2" out_h1="$3" out_h2="$4"
+  local h1 h2
+  h1=$(compute_normalized_hash "$f1") || return $?
+  h2=$(compute_normalized_hash "$f2") || return $?
+  if [ -n "$out_h1" ]; then printf -v "$out_h1" '%s' "$h1"; fi
+  if [ -n "$out_h2" ]; then printf -v "$out_h2" '%s' "$h2"; fi
+  if [ "$h1" = "$h2" ]; then
+    return 0
+  fi
+  return 1
+}
+
 ui_compare() {
-  local f1 f2
+  local f1 f2 h1 h2 rc
   f1=$(pick_file_fzf "$PWD") || return
   f2=$(pick_file_fzf "$PWD") || return
   dialog --infobox "Normalizing and comparing..." 5 50
-  h1=$(compute_normalized_hash "$f1")
-  h2=$(compute_normalized_hash "$f2")
-  if [ "$h1" = "$h2" ]; then
+  if compare_hashes_cmd "$f1" "$f2" h1 h2; then
     dialog --msgbox "Files are identical (ignoring metadata)\n\nHash: $h1" 10 60
   else
-    dialog --msgbox "Files differ (ignoring metadata)\n\n$h1\n$h2" 12 70
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+      dialog --msgbox "Files differ (ignoring metadata)\n\n$h1\n$h2" 12 70
+    else
+      dialog --msgbox "Comparison failed (exit $rc)" 8 50
+      return $rc
+    fi
   fi
 }
 
@@ -440,7 +470,7 @@ ui_compare_pixels() {
   f1=$(pick_file_fzf "$PWD") || return
   f2=$(pick_file_fzf "$PWD") || return
   dialog --infobox "Computing pixel difference..." 4 50
-  out=$(compare_pixels_cmd "$f1" "$f2" 2>&1) || out=$out
+  out=$(compare_pixels_cmd "$f1" "$f2" 2>&1) || true
   dialog --msgbox "$out" 10 70
 }
 
@@ -650,10 +680,20 @@ case "$cmd" in
 
   compare)
     if [ $# -ne 2 ]; then err "compare needs two filenames"; exit 2; fi
-    f1="$1"; f2="$2"
-    h1=$(compute_normalized_hash "$f1")
-    h2=$(compute_normalized_hash "$f2")
-    if [ "$h1" = "$h2" ]; then echo "IDENTICAL (ignoring metadata) — $h1"; exit 0; else echo "DIFFER — $h1 vs $h2"; exit 1; fi
+    h1=""; h2=""
+    if compare_hashes_cmd "$1" "$2" h1 h2; then
+      echo "IDENTICAL (ignoring metadata) — $h1"
+      exit 0
+    else
+      rc=$?
+      if [ "$rc" -eq 1 ]; then
+        echo "DIFFER — $h1 vs $h2"
+        exit 1
+      else
+        err "Comparison failed (exit $rc)"
+        exit "$rc"
+      fi
+    fi
     ;;
 
   compare-pixels)
