@@ -44,7 +44,7 @@ which_or_warn() {
   return 0
 }
 cpu_count() {
-  if command -v nproc >/dev/null 2>&1; then nproc; elif command -v sysctl >/dev/null 2>&1; sysctl -n hw.ncpu; else echo 1; fi
+  if command -v nproc >/dev/null 2>&1; then nproc; elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu; else echo 1; fi
 }
 
 # ---------------------------
