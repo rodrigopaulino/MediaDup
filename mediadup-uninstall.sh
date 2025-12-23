@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# uninstall-mediadup.sh
-# Safely uninstall the mediadup tool and (optionally) packages installed by setup.
+# mediadup-uninstall.sh
+# Safely uninstall the MediaDup tool and (optionally) packages installed by setup.
 #
 # Usage:
-#   sudo ./uninstall-mediadup.sh                 # interactive, remove mediadup files
-#   sudo ./uninstall-mediadup.sh --dry-run       # show what would be removed
-#   sudo ./uninstall-mediadup.sh --remove-packages --yes
+#   sudo ./mediadup-uninstall.sh                 # interactive, remove MediaDup files
+#   sudo ./mediadup-uninstall.sh --dry-run       # show what would be removed
+#   sudo ./mediadup-uninstall.sh --remove-packages --yes
 #
 # Notes:
-#  - By default only removes files installed by mediadup (binary, config, cache, DB).
-#  - --remove-packages attempts to remove packages: exiftool dcraw ffmpeg imagemagick sqlite3 parallel pv fzf dialog jq file
+#  - By default only removes files installed by MediaDup (binary, config, cache, DB).
+#  - --remove-packages attempts to remove packages via MacPorts: exiftool dcraw ffmpeg imagemagick sqlite3 parallel pv fzf dialog jq file
 #  - Removing system packages may affect other software — review the dry-run carefully.
 set -euo pipefail
 
@@ -22,15 +22,12 @@ BIN_PATH="/usr/local/bin/mediadup"
 CACHE_DIR="${HOME}/.cache/mediadup"
 CONFIG_DIR="${HOME}/.config/mediadup"
 DEFAULT_DB="${HOME}/.mediadup_cache.db"
-LOCAL_BIN_SRC="/usr/local/bin/mediadup-full.sh" # if present as separate file
-# any other known locations we used
-ALT_BIN="/usr/local/bin/mediadup-full.sh"
 
 PKGS=(exiftool dcraw ffmpeg imagemagick sqlite3 parallel pv fzf dialog jq file)
 
 usage() {
   cat <<EOF
-uninstall-mediadup.sh — remove mediadup and optional packages
+mediadup-uninstall.sh — remove MediaDup and optional packages
 
 Options:
   --dry-run           Show what would be removed, do not delete anything.
@@ -39,9 +36,9 @@ Options:
   -h, --help          Show this help.
 
 Examples:
-  sudo ./uninstall-mediadup.sh
-  sudo ./uninstall-mediadup.sh --dry-run
-  sudo ./uninstall-mediadup.sh --remove-packages --yes
+  sudo ./mediadup-uninstall.sh
+  sudo ./mediadup-uninstall.sh --dry-run
+  sudo ./mediadup-uninstall.sh --remove-packages --yes
 EOF
 }
 
@@ -56,7 +53,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-echo "=== mediadup uninstall utility ==="
+echo "=== MediaDup uninstall utility ==="
 echo "Binary:    $BIN_PATH"
 echo "Config dir: $CONFIG_DIR"
 echo "Cache dir: $CACHE_DIR"
@@ -81,49 +78,35 @@ confirm() {
 # Prepare list of file operations
 declare -a to_remove_files
 declare -a to_remove_dirs
-declare -a to_remove_sudo_cmds
 
 # binary
 if [ -f "$BIN_PATH" ]; then
   to_remove_files+=("$BIN_PATH")
-else
-  echo "Binary not found at $BIN_PATH"
 fi
-
-if [ -f "$ALT_BIN" ]; then
-  to_remove_files+=("$ALT_BIN")
+if [ -f "$DEFAULT_DB" ]; then
+  to_remove_files+=("$DEFAULT_DB")
 fi
-
-# user config/cache/db
 if [ -d "$CONFIG_DIR" ]; then
   to_remove_dirs+=("$CONFIG_DIR")
 fi
 if [ -d "$CACHE_DIR" ]; then
   to_remove_dirs+=("$CACHE_DIR")
 fi
-if [ -f "$DEFAULT_DB" ]; then
-  to_remove_files+=("$DEFAULT_DB")
-fi
-
-# logs/state
-STATE_DIR="${HOME}/.local/state/mediadup"
-if [ -d "$STATE_DIR" ]; then
-  to_remove_dirs+=("$STATE_DIR")
-fi
-
-# system-wide share (if any)
-SHARE_DIR="/usr/local/share/mediadup"
-if [ -d "$SHARE_DIR" ]; then
-  to_remove_dirs+=("$SHARE_DIR")
-fi
 
 echo "Planned removals:"
-for f in "${to_remove_files[@]}"; do echo "  FILE: $f"; done
-for d in "${to_remove_dirs[@]}"; do echo "  DIR:  $d"; done
-
+if [ "${#to_remove_files[@]}" -gt 0 ]; then
+  for f in "${to_remove_files[@]}"; do echo "  FILE: $f"; done
+else
+  echo "  FILE: (none)"
+fi
+if [ "${#to_remove_dirs[@]}" -gt 0 ]; then
+  for d in "${to_remove_dirs[@]}"; do echo "  DIR:  $d"; done
+else
+  echo "  DIR:  (none)"
+fi
 if [ "$REMOVE_PKGS" -eq 1 ]; then
   echo
-  echo "Packages to remove (if found): ${PKGS[*]}"
+  echo "MacPorts packages to remove (if found): ${PKGS[*]}"
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -132,118 +115,63 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+echo
+
 if ! confirm "Proceed with deletion of the listed items?"; then
   echo "Aborted by user."
   exit 0
 fi
 
 # remove files (user-owned)
-for f in "${to_remove_files[@]}"; do
-  if [ -f "$f" ]; then
-    echo "Removing file: $f"
-    if [ "$(dirname "$f")" = "/usr/local/bin" ]; then
-      # requires sudo
-      if [ "$DRY_RUN" -eq 0 ]; then
+if [ "${#to_remove_files[@]}" -gt 0 ]; then
+  for f in "${to_remove_files[@]}"; do
+    if [ -f "$f" ]; then
+      echo "Removing file: $f"
+      if [ "$(dirname "$f")" = "/usr/local/bin" ]; then
+        # requires sudo
         sudo rm -f "$f"
+      else
+        rm -f "$f"
       fi
-    else
-      rm -f "$f"
     fi
-  fi
-done
+  done
+fi
 
 # remove dirs
-for d in "${to_remove_dirs[@]}"; do
-  if [ -d "$d" ]; then
-    echo "Removing directory: $d"
-    if [[ "$d" == /usr/local/* || "$d" == /usr/share/* ]]; then
-      if [ "$DRY_RUN" -eq 0 ]; then
-        sudo rm -rf "$d"
-      fi
-    else
+if [ "${#to_remove_dirs[@]}" -gt 0 ]; then
+  for d in "${to_remove_dirs[@]}"; do
+    if [ -d "$d" ]; then
+      echo "Removing directory: $d"
       rm -rf "$d"
     fi
-  fi
-done
+  done
+fi
 
 # optionally remove packages
 if [ "$REMOVE_PKGS" -eq 1 ]; then
   echo
-  echo "Detecting package manager..."
-  if command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR="apt"
-    echo "Using apt to remove packages (dry-run will not remove)."
-    if [ "$AUTO_YES" -eq 0 ]; then
-      echo "Note: apt will be invoked with --purge -y; this will remove packages and their configuration."
+  INSTALLED=()
+  for pkg in "${PKGS[@]}"; do
+    if port installed "$pkg" 2>/dev/null | grep -q "(active)"; then
+      INSTALLED+=("$pkg")
     fi
-    # build list of packages that are installed
-    INSTALLED=()
-    for pkg in "${PKGS[@]}"; do
-      if dpkg -s "$pkg" >/dev/null 2>&1; then INSTALLED+=("$pkg"); fi
-    done
-    if [ "${#INSTALLED[@]}" -eq 0 ]; then
-      echo "No listed packages appear installed via apt."
-    else
-      echo "Packages installed to be removed: ${INSTALLED[*]}"
-      if confirm "Proceed to apt remove these packages?"; then
-        if [ "$DRY_RUN" -eq 0 ]; then
-          sudo apt-get remove --purge -y "${INSTALLED[@]}"
-          sudo apt-get autoremove -y
-        fi
-      else
-        echo "Skipping package removal."
-      fi
-    fi
+  done
 
-  elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
-    PKG_MGR="yum"
-    PM=$(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum)
-    INSTALLED=()
-    for pkg in "${PKGS[@]}"; do
-      if rpm -q "$pkg" >/dev/null 2>&1; then INSTALLED+=("$pkg"); fi
-    done
-    if [ "${#INSTALLED[@]}" -eq 0 ]; then
-      echo "No listed packages appear installed via rpm/yum."
-    else
-      echo "Packages installed to be removed: ${INSTALLED[*]}"
-      if confirm "Proceed to remove via $PM?"; then
-        if [ "$DRY_RUN" -eq 0 ]; then
-          sudo $PM remove -y "${INSTALLED[@]}"
-        fi
-      else
-        echo "Skipping package removal."
-      fi
-    fi
-
-  elif command -v brew >/dev/null 2>&1; then
-    PKG_MGR="brew"
-    INSTALLED=()
-    for pkg in "${PKGS[@]}"; do
-      # brew package names may differ; test by brew list
-      if brew list --formula | grep -xq "$pkg"; then INSTALLED+=("$pkg"); fi
-    done
-    if [ "${#INSTALLED[@]}" -eq 0 ]; then
-      echo "No listed packages appear installed via brew (exact-name match)."
-    else
-      echo "Packages installed to be removed (brew): ${INSTALLED[*]}"
-      if confirm "Proceed to brew uninstall these packages?"; then
-        if [ "$DRY_RUN" -eq 0 ]; then
-          for pkg in "${INSTALLED[@]}"; do
-            brew uninstall "$pkg" || true
-          done
-        fi
-      else
-        echo "Skipping package removal."
-      fi
-    fi
-
+  if [ "${#INSTALLED[@]}" -eq 0 ]; then
+    echo "No listed packages are active in MacPorts."
   else
-    echo "No known package manager detected (apt/yum/brew). Please remove packages manually if desired:"
-    echo "  ${PKGS[*]}"
+    echo "Active MacPorts packages to uninstall: ${INSTALLED[*]}"
+    if confirm "Proceed to uninstall these packages via MacPorts?"; then
+      for pkg in "${INSTALLED[@]}"; do
+        echo "Uninstalling $pkg via MacPorts..."
+        port uninstall "$pkg" || true
+      done
+    else
+      echo "Skipping package removal."
+    fi
   fi
 fi
 
 echo
 echo "Uninstall complete."
-echo "If you removed the sqlite DB and cache, you have removed mediadup state. Any other artifacts (e.g., duplicates moved to trash) remain where created."
-echo "If you want a complete system purge, consider running an additional 'sudo updatedb' if your locate/db is stale (optional)."
+echo "If you removed the sqlite DB and cache, you have removed MediaDup state. Any other artifacts (e.g., duplicates moved to trash) remain where created."
