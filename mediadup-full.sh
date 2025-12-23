@@ -171,17 +171,19 @@ SQL
 get_cached_hash() {
   local db="$1"; local path="$2"; local mtime="$3"; local size="$4"
   if command -v sqlite3 >/dev/null 2>&1 && [ -f "$db" ]; then
-    sqlite3 "$db" "SELECT hash FROM filehash WHERE path = $(printf '%q' "$path") AND mtime = $mtime AND size = $size LIMIT 1;"
+    local path_sql
+    path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
+    sqlite3 "$db" "SELECT hash FROM filehash WHERE path = '$path_sql' AND mtime = $mtime AND size = $size LIMIT 1;"
   fi
 }
 
 store_cached_hash() {
   local db="$1"; local path="$2"; local mtime="$3"; local size="$4"; local hash="$5"
   if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$db" <<SQL 2>/dev/null || true
-INSERT OR REPLACE INTO filehash(path, mtime, size, hash, updated_at)
-VALUES($(printf '%q' "$path"), $mtime, $size, $(printf '%q' "$hash"), strftime('%s','now'));
-SQL
+    local path_sql hash_sql
+    path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
+    hash_sql=$(printf "%s" "$hash" | sed "s/'/''/g")
+    sqlite3 "$db" "INSERT OR REPLACE INTO filehash(path, mtime, size, hash, updated_at) VALUES('$path_sql', $mtime, $size, '$hash_sql', strftime('%s','now'));" 2>/dev/null || true
   fi
 }
 
@@ -225,6 +227,11 @@ worker_main() {
 # ---------------------------
 find_duplicates_main() {
   local root="$1"
+  if [ "$root" != "/" ]; then root="${root%/}"; fi
+  if [ -z "$root" ]; then
+    err "path missing"
+    return 2
+  fi
   local cache_db="${CACHE_DB:-$DEFAULT_CACHE_DB}"
   local jobs="${JOBS:-$(cpu_count)}"
   local action="${ACTION:-print}"
@@ -248,13 +255,13 @@ find_duplicates_main() {
 
   if command -v parallel >/dev/null 2>&1; then
     # use GNU parallel
-    printf "%s\n" "${files[@]}" | parallel --jobs "$jobs" --bar --line-buffer "$(readlink -f "$0")" worker "$cache_db" {} > "$output"
+    printf "%s\n" "${files[@]}" | parallel --will-cite --jobs "$jobs" --bar --line-buffer "$(which "$0")" worker "$cache_db" {} > "$output"
   else
     # fallback xargs -P
     if command -v pv >/dev/null 2>&1 && [ "$use_pv" -eq 1 ]; then
-      printf "%s\n" "${files[@]}" | pv -N files -s "$total" -l | xargs -I{} -n1 -P "$jobs" bash -c "$(readlink -f "$0") worker \"$cache_db\" \"{}\"" >> "$output"
+      printf "%s\n" "${files[@]}" | pv -N files -s "$total" -l | xargs -I{} -n1 -P "$jobs" bash -c "$(which "$0") worker \"$cache_db\" \"{}\"" >> "$output"
     else
-      printf "%s\n" "${files[@]}" | xargs -I{} -n1 -P "$jobs" bash -c "$(readlink -f "$0") worker \"$cache_db\" \"{}\"" >> "$output"
+      printf "%s\n" "${files[@]}" | xargs -I{} -n1 -P "$jobs" bash -c "$(which "$0") worker \"$cache_db\" \"{}\"" >> "$output"
     fi
   fi
 
@@ -276,13 +283,21 @@ find_duplicates_main() {
 
   # Save a JSON-ish results file for dashboard/TUI
   local results_json="${CACHE_DIR}/last_scan.json"
+  if [ -f "$results_json" ]; then
+    local stamp backup_json
+    stamp=$(date -r "$results_json" +%Y%m%d-%H%M%S 2>/dev/null || date +%Y%m%d-%H%M%S)
+    backup_json="${results_json%.json}_${stamp}.json"
+    if ! mv "$results_json" "$backup_json"; then
+      err "Failed to rotate previous results file ($results_json)"
+    fi
+  fi
   echo "[]" > "$results_json"
   local group_count=0
   local total_reclaim=0
 
   for h in "${!groups[@]}"; do
-    # split into array
-    IFS=$'\n' read -rd '' -a arr <<< "${groups[$h]}"
+    # split newline-delimited paths into an array
+    mapfile -t arr < <(printf '%s\n' "${groups[$h]}")
     if [ "${#arr[@]}" -gt 1 ]; then
       group_count=$((group_count+1))
       # estimate reclaimable size: sum sizes except first
@@ -344,7 +359,13 @@ find_duplicates_main() {
 
       # append to results_json: simple line-oriented JSON array
       # we append manual JSON chunk
-      if jq -c --arg h "$h" --argjson cnt "${#arr[@]}" --arg keep "${arr[0]}" --argfile files <(printf '%s\n' "${arr[@]}" | jq -R . | jq -s .) \
+      local files_json
+      if ! files_json=$(printf '%s\n' "${arr[@]}" | jq -R . | jq -s .); then
+        err "Failed to encode duplicate file list for $h"
+        continue
+      fi
+
+      if jq -c --arg h "$h" --argjson cnt "${#arr[@]}" --arg keep "${arr[0]}" --argjson files "$files_json" \
         '. + [ {hash:$h, count:$cnt, keep:$keep, files:$files} ]' "$results_json" > "${results_json}.tmp"; then
         mv "${results_json}.tmp" "$results_json"
       else
@@ -380,6 +401,7 @@ compare_pixels_cmd() {
   local f1="$1" f2="$2"
   local tmp1 tmp2
   tmp1=$(mktemp "${CACHE_DIR}/p1.XXXX") ; tmp2=$(mktemp "${CACHE_DIR}/p2.XXXX")
+  rm -f "$tmp1" "$tmp2"
   normalize_raster "$f1" "$tmp1"
   normalize_raster "$f2" "$tmp2"
   if command -v compare >/dev/null 2>&1; then
@@ -420,7 +442,6 @@ tui_main() {
       5) ui_view_results ;;
       6) ui_dashboard ;;
       7) ui_theme_choice ;;
-      8) clear; exit 0 ;;
       *) break ;;
     esac
   done
@@ -596,7 +617,17 @@ ui_dashboard() {
     else
       cpu_usage=0
     fi
-    mem_info=$(free -m | awk '/Mem/ {printf "%s/%s MB", $3,$2}')
+    page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)
+    pages_free=$(vm_stat 2>/dev/null | awk '/Pages free/ {print $3}' | tr -d '.')
+    pages_spec=$(vm_stat 2>/dev/null | awk '/Pages speculative/ {print $3}' | tr -d '.')
+    total_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    if [ -n "$pages_free" ] && [ -n "$pages_spec" ] && [ "$total_bytes" -gt 0 ]; then
+      free_bytes=$(( (pages_free + pages_spec) * page_size ))
+      used_bytes=$(( total_bytes - free_bytes ))
+      mem_info=$(printf "%d/%d MB" $((used_bytes / 1024 / 1024)) $((total_bytes / 1024 / 1024)))
+    else
+      mem_info="n/a"
+    fi
     echo "CPU: ${cpu_usage}%   MEM: ${mem_info}"
     # mediadup stats.json
     if [ -f "${CACHE_DIR}/stats.json" ]; then
@@ -708,6 +739,7 @@ case "$cmd" in
 
   tui)
     tui_main
+    clear
     ;;
 
   *)
