@@ -11,7 +11,6 @@
 #  - compare & compare-pixels & hash single file
 #  - mediadup tui: interactive menu (dialog + fzf)
 #  - Dashboard: htop-like live refresh (reads state files written by scans)
-#  - Themes: Solarized/Dracula/Nord/Classic (saved at ~/.config/mediadup/theme.conf)
 #
 # Usage:
 #   ./mediadup-full.sh find-duplicates /path [--cache-db path] [--jobs N] [--action print|hardlink|symlink|move|none] [--trash-dir path]
@@ -46,28 +45,6 @@ which_or_warn() {
 cpu_count() {
   if command -v nproc >/dev/null 2>&1; then nproc; elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu; else echo 1; fi
 }
-
-# ---------------------------
-# Theme handling
-# ---------------------------
-THEME_CONF="${HOME_CONFIG}/theme.conf"
-default_theme() {
-  cat > "$THEME_CONF" <<'EOF'
-name=Solarized
-bg=#002b36
-text=#93a1a1
-highlight=#268bd2
-accent=#b58900
-warn=#cb4b16
-EOF
-}
-if [ ! -f "$THEME_CONF" ]; then default_theme; fi
-load_theme() {
-  # Export simple color vars (terminal color codes will be approximated)
-  name=$(awk -F= '/^name=/ {print $2}' "$THEME_CONF")
-  THEME_NAME="$name"
-}
-load_theme
 
 # ---------------------------
 # Normalization & hashing helpers
@@ -432,8 +409,7 @@ tui_main() {
       4 "Scan folder for duplicates" \
       5 "View last scan results" \
       6 "Dashboard (live)" \
-      7 "Settings: theme" \
-      8 "Exit")
+      7 "Exit")
     case "$CHOICE" in
       1) ui_compare ;;
       2) ui_compare_pixels ;;
@@ -441,7 +417,7 @@ tui_main() {
       4) ui_scan ;;
       5) ui_view_results ;;
       6) ui_dashboard ;;
-      7) ui_theme_choice ;;
+      7) break ;;
       *) break ;;
     esac
   done
@@ -450,19 +426,21 @@ tui_main() {
 pick_file_fzf() {
   local start="${1:-.}"
   local pick
-  pick=$(find "$start" -type f 2>/dev/null | fzf --height=40% --preview 'file --mime {} 2>/dev/null' --border --prompt="Select file: ")
+  if ! pick=$(find "$start" -type f 2>/dev/null | fzf --height=40% --preview 'file --mime {} 2>/dev/null' --border --prompt="Select file: "); then
+    return 1
+  fi
   echo "$pick"
 }
 
 # shared compare helper for CLI and TUI (prints into provided var names)
 compare_hashes_cmd() {
   local f1="$1" f2="$2" out_h1="$3" out_h2="$4"
-  local h1 h2
-  h1=$(compute_normalized_hash "$f1") || return $?
-  h2=$(compute_normalized_hash "$f2") || return $?
-  if [ -n "$out_h1" ]; then printf -v "$out_h1" '%s' "$h1"; fi
-  if [ -n "$out_h2" ]; then printf -v "$out_h2" '%s' "$h2"; fi
-  if [ "$h1" = "$h2" ]; then
+  local hash1 hash2
+  hash1=$(compute_normalized_hash "$f1") || return $?
+  hash2=$(compute_normalized_hash "$f2") || return $?
+  if [ -n "$out_h1" ]; then printf -v "$out_h1" '%s' "$hash1"; fi
+  if [ -n "$out_h2" ]; then printf -v "$out_h2" '%s' "$hash2"; fi
+  if [ "$hash1" = "$hash2" ]; then
     return 0
   fi
   return 1
@@ -537,62 +515,6 @@ ui_view_results() {
   dialog --textbox "${CACHE_DIR}/last_scan_output.txt" 30 80
 }
 
-ui_theme_choice() {
-  CHOICE=$(dialog --colors --stdout --menu "Pick theme" 18 78 6 \
-    Solarized "\Z6Calm text\Z0  \Z4highlight\Z0  \Z3accent\Z0" \
-    Dracula "\Z7Midnight text\Z0  \Z2neon highlight\Z0  \Z5magenta pop\Z0" \
-    Nord "\Z7Fjord text\Z0  \Z6frost highlight\Z0  \Z2moss accent\Z0" \
-    Classic "\Z2Retro console\Z0  \Zb\Z2bright prompt\Z0  \Z3amber warn\Z0" \
-    Reset "\Z7Reset to default palette\Z0")
-  case "$CHOICE" in
-    Solarized)
-      cat > "$THEME_CONF" <<'EOF'
-name=Solarized
-bg=#002b36
-text=#93a1a1
-highlight=#268bd2
-accent=#b58900
-warn=#cb4b16
-EOF
-      ;;
-    Dracula)
-      cat > "$THEME_CONF" <<'EOF'
-name=Dracula
-bg=#282a36
-text=#f8f8f2
-highlight=#50fa7b
-accent=#ff79c6
-warn=#ff5555
-EOF
-      ;;
-    Nord)
-      cat > "$THEME_CONF" <<'EOF'
-name=Nord
-bg=#2e3440
-text=#d8dee9
-highlight=#88c0d0
-accent=#a3be8c
-warn=#bf616a
-EOF
-      ;;
-    Classic)
-      cat > "$THEME_CONF" <<'EOF'
-name=Classic
-bg=black
-text=green
-highlight=brightgreen
-accent=yellow
-warn=red
-EOF
-      ;;
-    Reset)
-      default_theme
-      ;;
-  esac
-  load_theme
-  dialog --msgbox "Theme set to $(awk -F= '/^name=/ {print $2}' $THEME_CONF)" 6 40
-}
-
 # ---------------------------
 # Dashboard (htop-like)
 # ---------------------------
@@ -600,8 +522,7 @@ ui_dashboard() {
   # minimal ncurses-like live view
   while true; do
     clear
-    load_theme
-    echo -e "\e[1;36mMEDIA DUPLICATION DASHBOARD — Theme: $THEME_NAME\e[0m"
+    echo -e "\e[1;36mMEDIA DUPLICATION DASHBOARD\e[0m"
     echo "────────────────────────────────────────────────────────────────"
     # system stats
     if [ -f /proc/stat ]; then
