@@ -4,17 +4,14 @@
 #
 # Usage:
 #   sudo ./mediadup-uninstall.sh                 # interactive, remove MediaDup files
-#   sudo ./mediadup-uninstall.sh --dry-run       # show what would be removed
-#   sudo ./mediadup-uninstall.sh --remove-packages --yes
+#   sudo ./mediadup-uninstall.sh --yes           # non-interactive, remove everything
 #
 # Notes:
-#  - By default only removes files installed by MediaDup (binary, config, cache, DB).
-#  - --remove-packages attempts to remove packages via MacPorts: exiftool dcraw ffmpeg imagemagick sqlite3 parallel pv fzf dialog jq file
-#  - Removing system packages may affect other software — review the dry-run carefully.
+#  - Removes MediaDup files plus supporting MacPorts packages unless you answer "no" at the relevant prompts.
+#  - Packages removed: exiftool dcraw ffmpeg imagemagick sqlite3 parallel jq file
+#  - Removing system packages may affect other software — review the prompts carefully.
 set -euo pipefail
 
-DRY_RUN=0
-REMOVE_PKGS=0
 AUTO_YES=0
 
 # paths installed by the setup script we provided earlier
@@ -23,30 +20,25 @@ CACHE_DIR="${HOME}/.cache/mediadup"
 CONFIG_DIR="${HOME}/.config/mediadup"
 DEFAULT_DB="${HOME}/.mediadup_cache.db"
 
-PKGS=(exiftool dcraw ffmpeg imagemagick sqlite3 parallel pv fzf dialog jq file)
+PKGS=(exiftool dcraw ffmpeg imagemagick sqlite3 parallel jq file)
 
 usage() {
   cat <<EOF
 mediadup-uninstall.sh — remove MediaDup and optional packages
 
 Options:
-  --dry-run           Show what would be removed, do not delete anything.
-  --remove-packages   Also attempt to uninstall system packages installed by the setup script.
   --yes               Skip confirmation prompts (use with care).
   -h, --help          Show this help.
 
 Examples:
   sudo ./mediadup-uninstall.sh
-  sudo ./mediadup-uninstall.sh --dry-run
-  sudo ./mediadup-uninstall.sh --remove-packages --yes
+  sudo ./mediadup-uninstall.sh --yes
 EOF
 }
 
 # parse args
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run) DRY_RUN=1; shift ;;
-    --remove-packages) REMOVE_PKGS=1; shift ;;
     --yes) AUTO_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 2 ;;
@@ -60,10 +52,6 @@ echo "Cache dir: $CACHE_DIR"
 echo "Cache DB:  $DEFAULT_DB"
 echo
 
-if [ "$DRY_RUN" -eq 1 ]; then
-  echo "[DRY RUN] No files will be deleted."
-fi
-
 confirm() {
   if [ "$AUTO_YES" -eq 1 ]; then
     return 0
@@ -75,9 +63,33 @@ confirm() {
   esac
 }
 
+prune_leaves_loop() {
+  local pass=1
+  while true; do
+    local -a leaves=()
+    while IFS= read -r leaf; do
+      [ -n "$leaf" ] && leaves+=("$leaf")
+    done < <(port echo leaves 2>/dev/null | awk '{print $1}')
+    if [ "${#leaves[@]}" -eq 0 ]; then
+      if [ "$pass" -eq 1 ]; then
+        echo "No MacPorts leaf packages detected."
+      else
+        echo "No more leaf packages remain."
+      fi
+      break
+    fi
+    echo "Leaf uninstall pass $pass: ${leaves[*]}"
+    if ! port uninstall leaves; then
+      echo "port uninstall leaves reported an error; stopping leaf cleanup." >&2
+      break
+    fi
+    pass=$((pass+1))
+  done
+}
+
 # Prepare list of file operations
-declare -a to_remove_files
-declare -a to_remove_dirs
+declare -a to_remove_files=()
+declare -a to_remove_dirs=()
 
 # binary
 if [ -f "$BIN_PATH" ]; then
@@ -96,33 +108,14 @@ fi
 echo "Planned removals:"
 if [ "${#to_remove_files[@]}" -gt 0 ]; then
   for f in "${to_remove_files[@]}"; do echo "  FILE: $f"; done
+  if ! confirm "Remove the listed files?"; then
+    echo "Skipping file removal."
+    to_remove_files=()
+  fi
 else
   echo "  FILE: (none)"
 fi
-if [ "${#to_remove_dirs[@]}" -gt 0 ]; then
-  for d in "${to_remove_dirs[@]}"; do echo "  DIR:  $d"; done
-else
-  echo "  DIR:  (none)"
-fi
-if [ "$REMOVE_PKGS" -eq 1 ]; then
-  echo
-  echo "MacPorts packages to remove (if found): ${PKGS[*]}"
-fi
 
-if [ "$DRY_RUN" -eq 1 ]; then
-  echo
-  echo "Dry-run mode. Exiting without deleting anything."
-  exit 0
-fi
-
-echo
-
-if ! confirm "Proceed with deletion of the listed items?"; then
-  echo "Aborted by user."
-  exit 0
-fi
-
-# remove files (user-owned)
 if [ "${#to_remove_files[@]}" -gt 0 ]; then
   for f in "${to_remove_files[@]}"; do
     if [ -f "$f" ]; then
@@ -137,7 +130,16 @@ if [ "${#to_remove_files[@]}" -gt 0 ]; then
   done
 fi
 
-# remove dirs
+if [ "${#to_remove_dirs[@]}" -gt 0 ]; then
+  for d in "${to_remove_dirs[@]}"; do echo "  DIR:  $d"; done
+  if ! confirm "Remove the listed directories?"; then
+    echo "Skipping directory removal."
+    to_remove_dirs=()
+  fi
+else
+  echo "  DIR:  (none)"
+fi
+
 if [ "${#to_remove_dirs[@]}" -gt 0 ]; then
   for d in "${to_remove_dirs[@]}"; do
     if [ -d "$d" ]; then
@@ -147,29 +149,36 @@ if [ "${#to_remove_dirs[@]}" -gt 0 ]; then
   done
 fi
 
-# optionally remove packages
-if [ "$REMOVE_PKGS" -eq 1 ]; then
-  echo
-  INSTALLED=()
-  for pkg in "${PKGS[@]}"; do
-    if port installed "$pkg" 2>/dev/null | grep -q "(active)"; then
-      INSTALLED+=("$pkg")
-    fi
-  done
-
-  if [ "${#INSTALLED[@]}" -eq 0 ]; then
-    echo "No listed packages are active in MacPorts."
-  else
-    echo "Active MacPorts packages to uninstall: ${INSTALLED[*]}"
-    if confirm "Proceed to uninstall these packages via MacPorts?"; then
-      for pkg in "${INSTALLED[@]}"; do
-        echo "Uninstalling $pkg via MacPorts..."
-        port uninstall "$pkg" || true
-      done
-    else
-      echo "Skipping package removal."
-    fi
+echo
+INSTALLED=()
+for pkg in "${PKGS[@]}"; do
+  if port installed "$pkg" 2>/dev/null | grep -q "(active)"; then
+    INSTALLED+=("$pkg")
   fi
+done
+
+if [ "${#INSTALLED[@]}" -eq 0 ]; then
+  echo "No listed packages are active in MacPorts."
+else
+  echo "Active MacPorts packages to uninstall: ${INSTALLED[*]}"
+  if confirm "Uninstall these packages via MacPorts?"; then
+    for pkg in "${INSTALLED[@]}"; do
+      echo "Uninstalling $pkg via MacPorts..."
+      port uninstall "$pkg" || true
+    done
+  else
+    echo "Skipping package removal."
+  fi
+fi
+
+if port echo leaves 2>/dev/null | grep -q '\S'; then
+  if confirm "Run 'port uninstall leaves' repeatedly to prune unused dependencies?"; then
+    prune_leaves_loop
+  else
+    echo "Skipping leaf dependency cleanup."
+  fi
+else
+  echo "No MacPorts leaf packages detected."
 fi
 
 echo

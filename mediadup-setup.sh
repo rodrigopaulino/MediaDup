@@ -6,7 +6,7 @@ set -euo pipefail
 
 DEST="/usr/local/bin/mediadup"
 SRC_LOCAL="./mediadup-full.sh"   # if you run setup from same folder
-PKGS=(exiftool dcraw ffmpeg ImageMagick sqlite3 parallel pv fzf dialog jq file)
+PKGS=(exiftool dcraw ffmpeg ImageMagick sqlite3 parallel jq file)
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "This setup script should be run with sudo (to install system packages and copy binary)."
@@ -47,7 +47,10 @@ fi
 mkdir -p "${HOME}/.cache/mediadup" "${HOME}/.config/mediadup"
 
 echo "Setup complete."
-echo "Run 'mediadup' (or sudo -u $SUDO_USER mediadup tui) to start the TUI."
-echo "Example quick scan:"
+echo "Run 'mediadup' for CLI usage. Common commands:"
+echo "  mediadup compare fileA fileB"
+echo "  mediadup compare-pixels imageA imageB"
+echo "  mediadup hash file"
+echo "Example duplicate scan:"
 echo "  mediadup find-duplicates ~/Pictures --jobs $(nproc 2>/dev/null || echo 4) --action print --cache-db ${HOME}/.mediadup_cache.db"
 
