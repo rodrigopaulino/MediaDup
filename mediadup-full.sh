@@ -20,12 +20,11 @@ set -euo pipefail
 IFS=$'\n\t'
 
 PROG="$(basename "$0")"
-HOME_CONFIG="${HOME}/.config/mediadup"
 CACHE_DIR="${HOME}/.cache/mediadup"
 DEFAULT_CACHE_DB="${HOME}/.mediadup_cache.db"
 SKIPPED_LOG="${CACHE_DIR}/skipped_inputs.log"
 
-mkdir -p "$HOME_CONFIG" "$CACHE_DIR"
+mkdir -p "$CACHE_DIR"
 
 # ---------------------------
 # Utilities
@@ -33,6 +32,11 @@ mkdir -p "$HOME_CONFIG" "$CACHE_DIR"
 err() { echo "ERROR: $*" >&2; }
 info() { echo "$*"; }
 cpu_count() { sysctl -n hw.ncpu; }
+log_skipped_input() {
+  # reason, path
+  local reason="$1"; local path="$2"
+  printf "%s\t%s\t%s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$reason" "$path" >> "$SKIPPED_LOG"
+}
 
 # ---------------------------
 # Dependency checks
@@ -48,36 +52,6 @@ if [ "${#MISSING_CMDS[@]}" -gt 0 ]; then
   err "Missing required commands: ${MISSING_CMDS[*]}"
   exit 1
 fi
-
-log_skipped_input() {
-  # reason, path
-  local reason="$1"; local path="$2"
-  printf "%s\t%s\t%s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$reason" "$path" >> "$SKIPPED_LOG"
-}
-
-skip_token_message() {
-  case "$1" in
-    __SKIPPED_NOTFILE__) echo "Path is not a regular file (likely a folder)." ;;
-    __UNSUPPORTED__) echo "Unsupported media format." ;;
-    __MISSING__) echo "File is missing." ;;
-    __ERR__) echo "Unexpected hashing error." ;;
-    *) echo "Unknown hashing failure." ;;
-  esac
-}
-
-is_logged_skip_token() {
-  case "$1" in
-    __SKIPPED_NOTFILE__|__UNSUPPORTED__) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-is_skip_token() {
-  case "$1" in
-    __SKIPPED_NOTFILE__|__UNSUPPORTED__|__MISSING__) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
 # ---------------------------
 # Normalization & hashing helpers
@@ -113,11 +87,10 @@ compute_normalized_hash() {
   if [ ! -f "$file" ]; then
     if [ -e "$file" ]; then
       log_skipped_input "not-regular-file" "$file"
-      echo "__SKIPPED_NOTFILE__"
     else
-      echo "__MISSING__"
+      log_skipped_input "missing-file" "$file"
     fi
-    return 1
+    return 2
   fi
   local e=$(ext "$file")
   local tmpd
@@ -141,12 +114,15 @@ compute_normalized_hash() {
       if [ -f "$tmpd/stream_audio.bin" ]; then
         ha=$(hash_file "$tmpd/stream_audio.bin")
       else ha="NOAUDIO"; fi
+      if [ "$hv" = "NOVIDEO" ] && [ "$ha" = "NOAUDIO" ]; then
+        log_skipped_input "video-no-streams" "$file"
+        return 2
+      fi
       echo "${hv}-${ha}"
       ;;
     *)
       log_skipped_input "unsupported-extension:${e:-unknown}" "$file"
-      echo "__UNSUPPORTED__"
-      return 1
+      return 2
       ;;
   esac
 }
@@ -193,7 +169,15 @@ store_cached_hash() {
 worker_main() {
   # args: cache_db file
   local cache_db="$1"; local file="$2"
-  if [ ! -f "$file" ]; then echo "__MISSING__|$file"; exit 0; fi
+  if [ ! -f "$file" ]; then
+    if [ -e "$file" ]; then
+      log_skipped_input "not-regular-file" "$file"
+    else
+      log_skipped_input "missing-file" "$file"
+    fi
+    exit 2
+  fi
+
   local size mtime
   if stat --version >/dev/null 2>&1; then
     size=$(stat -c%s "$file"); mtime=$(stat -c%Y "$file")
@@ -205,17 +189,24 @@ worker_main() {
   if [ -n "$cache_db" ] && [ -f "$cache_db" ]; then
     cached=$(get_cached_hash "$cache_db" "$file" "$mtime" "$size")
     if [ -n "$cached" ]; then
-      echo "$cached|$file"; exit 0
+      echo "$cached|$file";
+      exit 0
     fi
   fi
 
   local result
-  result=$(compute_normalized_hash "$file" 2>/dev/null) || result="__ERR__"
-  if [ -n "$result" ] && [ "$result" != "__ERR__" ]; then
-    # store
-    if [ -n "$cache_db" ]; then
-      store_cached_hash "$cache_db" "$file" "$mtime" "$size" "$result" || true
+  result=$(compute_normalized_hash "$file" 2>/dev/null)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    if [ $rc -ne 2 ]; then
+      log_skipped_input "hashing-error" "$file"
     fi
+    exit 2
+  fi
+
+  # store
+  if [ -n "$cache_db" ]; then
+    store_cached_hash "$cache_db" "$file" "$mtime" "$size" "$result" || true
   fi
 
   echo "$result|$file"
@@ -259,9 +250,6 @@ find_duplicates_main() {
   while IFS= read -r line; do
     hashpart="${line%%|*}"
     path="${line#*|}"
-    case "$hashpart" in
-      __ERR__|__MISSING__|__UNSUPPORTED__|__SKIPPED_NOTFILE__|NOVIDEO-NOAUDIO) continue ;;
-    esac
 
     if [ -z "${groups[$hashpart]+set}" ]; then
       groups["$hashpart"]="$path"
@@ -403,16 +391,10 @@ compare_hashes_cmd() {
   local hash1 hash2
   if ! hash1=$(compute_normalized_hash "$f1"); then
     if [ -n "$out_h1" ]; then printf -v "$out_h1" '%s' "$hash1"; fi
-    if is_skip_token "$hash1"; then
-      return 3
-    fi
     return 2
   fi
   if ! hash2=$(compute_normalized_hash "$f2"); then
     if [ -n "$out_h2" ]; then printf -v "$out_h2" '%s' "$hash2"; fi
-    if is_skip_token "$hash2"; then
-      return 3
-    fi
     return 2
   fi
   if [ -n "$out_h1" ]; then printf -v "$out_h1" '%s' "$hash1"; fi
@@ -478,22 +460,16 @@ case "$cmd" in
       if [ "$rc" -eq 1 ]; then
         echo "DIFFER — $h1 vs $h2"
         exit 1
-      elif [ "$rc" -eq 3 ]; then
-        local token path msg suffix=""
-        token=""
-        path=""
-        if is_skip_token "$h1"; then token="$h1"; path="$1"; fi
-        if [ -z "$token" ] && is_skip_token "$h2"; then token="$h2"; path="$2"; fi
-        msg=$(skip_token_message "$token")
-        if is_logged_skip_token "$token"; then
-          suffix=" See ${SKIPPED_LOG}."
+      else
+        local path=""
+        if [ -z "$h1" ]; then
+          path="$1"
+        elif [ -z "$h2" ]; then
+          path="$2"
         fi
         if [ -z "$path" ]; then path="one of the provided paths"; fi
-        err "Compare skipped for $path: $msg${suffix}"
+        err "Compare skipped for $path: See ${SKIPPED_LOG}."
         exit 2
-      else
-        err "Comparison failed (exit $rc)"
-        exit "$rc"
       fi
     fi
     ;;
@@ -505,14 +481,9 @@ case "$cmd" in
 
   hash)
     if [ $# -ne 1 ]; then err "hash needs a file"; exit 2; fi
-    local out suffix=""
+    local out
     if ! out=$(compute_normalized_hash "$1"); then
-      local msg
-      msg=$(skip_token_message "$out")
-      if is_logged_skip_token "$out"; then
-        suffix=" See ${SKIPPED_LOG}."
-      fi
-      err "Hash skipped for $1: $msg${suffix}"
+      err "Hash skipped for $1: See ${SKIPPED_LOG}."
       exit 2
     fi
     echo "$out"

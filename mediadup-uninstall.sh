@@ -17,7 +17,6 @@ AUTO_YES=0
 # paths installed by the setup script we provided earlier
 BIN_PATH="/usr/local/bin/mediadup"
 CACHE_DIR="${HOME}/.cache/mediadup"
-CONFIG_DIR="${HOME}/.config/mediadup"
 DEFAULT_DB="${HOME}/.mediadup_cache.db"
 
 PKGS=(exiftool dcraw ffmpeg imagemagick sqlite3 parallel jq file)
@@ -47,7 +46,6 @@ done
 
 echo "=== MediaDup uninstall utility ==="
 echo "Binary:    $BIN_PATH"
-echo "Config dir: $CONFIG_DIR"
 echo "Cache dir: $CACHE_DIR"
 echo "Cache DB:  $DEFAULT_DB"
 echo
@@ -97,9 +95,6 @@ if [ -f "$BIN_PATH" ]; then
 fi
 if [ -f "$DEFAULT_DB" ]; then
   to_remove_files+=("$DEFAULT_DB")
-fi
-if [ -d "$CONFIG_DIR" ]; then
-  to_remove_dirs+=("$CONFIG_DIR")
 fi
 if [ -d "$CACHE_DIR" ]; then
   to_remove_dirs+=("$CACHE_DIR")
