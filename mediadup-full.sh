@@ -133,6 +133,8 @@ compute_normalized_hash() {
 init_cache_db() {
   local db="$1"
   sqlite3 "$db" <<'SQL' >/dev/null 2>&1 || true
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
 BEGIN;
 CREATE TABLE IF NOT EXISTS filehash (
   path TEXT PRIMARY KEY,
@@ -151,7 +153,7 @@ get_cached_hash() {
   if [ -f "$db" ]; then
     local path_sql
     path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
-    sqlite3 "$db" "SELECT hash FROM filehash WHERE path = '$path_sql' AND mtime = $mtime AND size = $size LIMIT 1;"
+    sqlite3 -cmd ".timeout 5000" "$db" "SELECT hash FROM filehash WHERE path = '$path_sql' AND mtime = $mtime AND size = $size LIMIT 1;"
   fi
 }
 
@@ -160,7 +162,7 @@ store_cached_hash() {
   local path_sql hash_sql
   path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
   hash_sql=$(printf "%s" "$hash" | sed "s/'/''/g")
-  sqlite3 "$db" "INSERT OR REPLACE INTO filehash(path, mtime, size, hash, updated_at) VALUES('$path_sql', $mtime, $size, '$hash_sql', strftime('%s','now'));" 2>/dev/null || true
+  sqlite3 -cmd ".timeout 5000" "$db" "INSERT OR REPLACE INTO filehash(path, mtime, size, hash, updated_at) VALUES('$path_sql', $mtime, $size, '$hash_sql', strftime('%s','now'));" 2>/dev/null || true
 }
 
 # ---------------------------
@@ -357,7 +359,7 @@ find_duplicates_main() {
   # runtime summary
   echo
   echo "Scan complete: found $group_count duplicate groups"
-  reclaim_human=$(numfmt --to=iec --suffix=B "$total_reclaim" 2>/dev/null || echo "${total_reclaim} bytes")
+  reclaim_human=$(gnumfmt --to=iec --suffix=B "$total_reclaim" 2>/dev/null || true)
   echo "Estimated recoverable: $reclaim_human"
   # write stats file for dashboard
   cat > "${CACHE_DIR}/stats.json" <<EOF
