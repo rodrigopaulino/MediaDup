@@ -37,6 +37,10 @@ log_skipped_input() {
   local reason="$1"; local path="$2"
   printf "%s\t%s\t%s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$reason" "$path" >> "$SKIPPED_LOG"
 }
+abs_path() {
+  local target="$1";
+  (cd "$target" >/dev/null 2>&1 && pwd)
+}
 
 # ---------------------------
 # Dependency checks
@@ -197,10 +201,8 @@ worker_main() {
   fi
 
   local result
-  result=$(compute_normalized_hash "$file" 2>/dev/null)
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    if [ $rc -ne 2 ]; then
+  if ! result=$(compute_normalized_hash "$file" 2>/dev/null); then
+    if [ $? -ne 2 ]; then
       log_skipped_input "hashing-error" "$file"
     fi
     exit 2
@@ -221,10 +223,11 @@ worker_main() {
 find_duplicates_main() {
   local root="$1"
   if [ "$root" != "/" ]; then root="${root%/}"; fi
-  if [ -z "$root" ]; then
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
     err "path missing"
     return 2
   fi
+  root=$(abs_path "$root")
   local cache_db="${CACHE_DB:-$DEFAULT_CACHE_DB}"
   local jobs="${JOBS:-$(cpu_count)}"
   local action="${ACTION:-print}"
@@ -243,9 +246,16 @@ find_duplicates_main() {
   # prepare temp and output
   local global_tmp
   global_tmp=$(mktemp -d "${CACHE_DIR}/global.XXXX")
+  chmod 777 "$global_tmp" 2>/dev/null || true
   local output="${global_tmp}/hashes.txt"; : > "$output"
 
+  set +e
   printf "%s\n" "${files[@]}" | parallel --will-cite --jobs "$jobs" --bar --line-buffer "$(which "$0")" worker "$cache_db" {} > "$output"
+  parallel_rc=$?
+  set -e
+  if [ $parallel_rc -ne 0 ]; then
+    err "Parallel workers completed with exit code $parallel_rc (see $SKIPPED_LOG for details)"
+  fi
 
   # Build groups
   declare -A groups
@@ -292,15 +302,12 @@ find_duplicates_main() {
       done
       total_reclaim=$((total_reclaim + size_reclaim_group))
 
-      # print group
-      echo
-      echo "=== Duplicate group (hash: $h) ==="
-      for p in "${arr[@]}"; do echo "  $p"; done
-
       # perform action
       case "$action" in
         print)
-          echo "Suggestion: keep '${arr[0]}', consider replacing others."
+          echo
+          echo "=== Duplicate group (hash: $h) ==="
+          for p in "${arr[@]}"; do echo "  $p"; done
           ;;
         hardlink)
           base="${arr[0]}"
