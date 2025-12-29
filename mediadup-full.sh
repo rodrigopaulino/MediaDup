@@ -94,7 +94,7 @@ compute_normalized_hash() {
     else
       log_skipped_input "missing-file" "$file"
     fi
-    return 2
+    exit 2
   fi
   local e=$(ext "$file")
   local tmpd
@@ -120,13 +120,13 @@ compute_normalized_hash() {
       else ha="NOAUDIO"; fi
       if [ "$hv" = "NOVIDEO" ] && [ "$ha" = "NOAUDIO" ]; then
         log_skipped_input "video-no-streams" "$file"
-        return 2
+        exit 2
       fi
       echo "${hv}-${ha}"
       ;;
     *)
       log_skipped_input "unsupported-extension:${e:-unknown}" "$file"
-      return 2
+      exit 2
       ;;
   esac
 }
@@ -202,7 +202,8 @@ worker_main() {
 
   local result
   if ! result=$(compute_normalized_hash "$file" 2>/dev/null); then
-    if [ $? -ne 2 ]; then
+    rc=$?
+    if [ $rc -ne 2 ]; then
       log_skipped_input "hashing-error" "$file"
     fi
     exit 2
@@ -246,16 +247,10 @@ find_duplicates_main() {
   # prepare temp and output
   local global_tmp
   global_tmp=$(mktemp -d "${CACHE_DIR}/global.XXXX")
-  chmod 777 "$global_tmp" 2>/dev/null || true
   local output="${global_tmp}/hashes.txt"; : > "$output"
+  trap 'rm -rf "$global_tmp"' EXIT
 
-  set +e
-  printf "%s\n" "${files[@]}" | parallel --will-cite --jobs "$jobs" --bar --line-buffer "$(which "$0")" worker "$cache_db" {} > "$output"
-  parallel_rc=$?
-  set -e
-  if [ $parallel_rc -ne 0 ]; then
-    err "Parallel workers completed with exit code $parallel_rc (see $SKIPPED_LOG for details)"
-  fi
+  printf "%s\n" "${files[@]}" | parallel --will-cite --jobs "$jobs" --bar --line-buffer "$(which "$0")" worker "$cache_db" {} > "$output" || true
 
   # Build groups
   declare -A groups
@@ -371,8 +366,6 @@ find_duplicates_main() {
   # write stats file for dashboard
   cat > "${CACHE_DIR}/stats.json" <<EOF
 {
-  "pending": 0,
-  "active": 0,
   "total": $total,
   "duplicate_groups": $group_count,
   "space_reclaimable_bytes": $total_reclaim
@@ -400,18 +393,18 @@ compare_hashes_cmd() {
   local hash1 hash2
   if ! hash1=$(compute_normalized_hash "$f1"); then
     if [ -n "$out_h1" ]; then printf -v "$out_h1" '%s' "$hash1"; fi
-    return 2
+    exit 2
   fi
   if ! hash2=$(compute_normalized_hash "$f2"); then
     if [ -n "$out_h2" ]; then printf -v "$out_h2" '%s' "$hash2"; fi
-    return 2
+    exit 2
   fi
   if [ -n "$out_h1" ]; then printf -v "$out_h1" '%s' "$hash1"; fi
   if [ -n "$out_h2" ]; then printf -v "$out_h2" '%s' "$hash2"; fi
   if [ "$hash1" = "$hash2" ]; then
-    return 0
+    exit 0
   fi
-  return 1
+  exit 1
 }
 
 # ---------------------------
