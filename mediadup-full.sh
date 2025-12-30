@@ -125,8 +125,8 @@ normalize_dng_raw() {
 normalize_video_streams() {
   # args: infile outprefix
   local infile="$1"; local out="$2"
-  ffmpeg -y -v error -i "$infile" -map 0:v:0 -c copy "${out}_video.bin" 2>/dev/null || true
-  ffmpeg -y -v error -i "$infile" -map 0:a:0 -c copy "${out}_audio.bin" 2>/dev/null || true
+  ffmpeg -y -v error -i "$infile" -map 0:v:0 -c copy -f data "${out}_video.bin" 2>/dev/null || true
+  ffmpeg -y -v error -i "$infile" -map 0:a:0 -c copy -f data "${out}_audio.bin" 2>/dev/null || true
 }
 
 compute_normalized_hash() {
