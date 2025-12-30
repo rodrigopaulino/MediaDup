@@ -41,6 +41,12 @@ abs_path() {
   local target="$1";
   (cd "$target" >/dev/null 2>&1 && pwd)
 }
+progress_tick() {
+  local current="$1"; local total="$2"; local label="$3"
+  local width=${#total}
+  if [ "$width" -lt 1 ]; then width=1; fi
+  printf "\r%s (%*d/%d)" "$label" "$width" "$current" "$total" >&2
+}
 
 # ---------------------------
 # Dependency checks
@@ -56,6 +62,44 @@ if [ "${#MISSING_CMDS[@]}" -gt 0 ]; then
   err "Missing required commands: ${MISSING_CMDS[*]}"
   exit 1
 fi
+
+# ---------------------------
+# Cache (sqlite) helpers
+# ---------------------------
+init_cache_db() {
+  local db="$1"
+  sqlite3 "$db" <<'SQL' >/dev/null 2>&1 || true
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
+BEGIN;
+CREATE TABLE IF NOT EXISTS filehash (
+  path TEXT PRIMARY KEY,
+  mtime INTEGER,
+  size INTEGER,
+  hash TEXT,
+  updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_mtime_size ON filehash(mtime,size);
+COMMIT;
+SQL
+}
+
+get_cached_hash() {
+  local db="$1"; local path="$2"; local mtime="$3"; local size="$4"
+  if [ -f "$db" ]; then
+    local path_sql
+    path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
+    sqlite3 -cmd ".timeout 5000" "$db" "SELECT hash FROM filehash WHERE path = '$path_sql' AND mtime = $mtime AND size = $size LIMIT 1;"
+  fi
+}
+
+store_cached_hash() {
+  local db="$1"; local path="$2"; local mtime="$3"; local size="$4"; local hash="$5"
+  local path_sql hash_sql
+  path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
+  hash_sql=$(printf "%s" "$hash" | sed "s/'/''/g")
+  sqlite3 -cmd ".timeout 5000" "$db" "INSERT OR REPLACE INTO filehash(path, mtime, size, hash, updated_at) VALUES('$path_sql', $mtime, $size, '$hash_sql', strftime('%s','now'));" 2>/dev/null || true
+}
 
 # ---------------------------
 # Normalization & hashing helpers
@@ -97,9 +141,8 @@ compute_normalized_hash() {
     exit 2
   fi
   local e=$(ext "$file")
-  local tmpd
   tmpd=$(mktemp -d "${CACHE_DIR}/tmp.XXXX")
-  trap 'rm -rf "$tmpd"' RETURN
+  trap 'rm -rf "$tmpd"' EXIT
 
   case "$e" in
     png|gif|jpg|jpeg)
@@ -107,7 +150,7 @@ compute_normalized_hash() {
       hash_file "$tmpd/norm.img"
       ;;
     dng)
-      normalize_dng_raw "$file" "$tmpd/norm.raw"
+      normalize_raster "$file" "$tmpd/norm.raw"
       hash_file "$tmpd/norm.raw"
       ;;
     mp4|mov)
@@ -132,44 +175,6 @@ compute_normalized_hash() {
 }
 
 # ---------------------------
-# Cache (sqlite) helpers
-# ---------------------------
-init_cache_db() {
-  local db="$1"
-  sqlite3 "$db" <<'SQL' >/dev/null 2>&1 || true
-PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=5000;
-BEGIN;
-CREATE TABLE IF NOT EXISTS filehash (
-  path TEXT PRIMARY KEY,
-  mtime INTEGER,
-  size INTEGER,
-  hash TEXT,
-  updated_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_mtime_size ON filehash(mtime,size);
-COMMIT;
-SQL
-}
-
-get_cached_hash() {
-  local db="$1"; local path="$2"; local mtime="$3"; local size="$4"
-  if [ -f "$db" ]; then
-    local path_sql
-    path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
-    sqlite3 -cmd ".timeout 5000" "$db" "SELECT hash FROM filehash WHERE path = '$path_sql' AND mtime = $mtime AND size = $size LIMIT 1;"
-  fi
-}
-
-store_cached_hash() {
-  local db="$1"; local path="$2"; local mtime="$3"; local size="$4"; local hash="$5"
-  local path_sql hash_sql
-  path_sql=$(printf "%s" "$path" | sed "s/'/''/g")
-  hash_sql=$(printf "%s" "$hash" | sed "s/'/''/g")
-  sqlite3 -cmd ".timeout 5000" "$db" "INSERT OR REPLACE INTO filehash(path, mtime, size, hash, updated_at) VALUES('$path_sql', $mtime, $size, '$hash_sql', strftime('%s','now'));" 2>/dev/null || true
-}
-
-# ---------------------------
 # Worker (invoked as subcommand 'worker')
 # ---------------------------
 worker_main() {
@@ -185,11 +190,7 @@ worker_main() {
   fi
 
   local size mtime
-  if stat --version >/dev/null 2>&1; then
-    size=$(stat -c%s "$file"); mtime=$(stat -c%Y "$file")
-  else
-    size=$(stat -f%z "$file"); mtime=$(stat -f%m "$file")
-  fi
+  size=$(stat -f%z "$file"); mtime=$(stat -f%m "$file")
 
   # attempt cache lookup
   if [ -n "$cache_db" ] && [ -f "$cache_db" ]; then
@@ -201,21 +202,19 @@ worker_main() {
   fi
 
   local result
-  if ! result=$(compute_normalized_hash "$file" 2>/dev/null); then
+  if result=$(compute_normalized_hash "$file" 2>/dev/null); then
+    if [ -n "$cache_db" ]; then
+      store_cached_hash "$cache_db" "$file" "$mtime" "$size" "$result" || true
+    fi
+    echo "$result|$file"
+    exit 0
+  else
     rc=$?
-    if [ $rc -ne 2 ]; then
+    if [ $rc -ne 0 ] && [ $rc -ne 2 ]; then
       log_skipped_input "hashing-error" "$file"
     fi
     exit 2
   fi
-
-  # store
-  if [ -n "$cache_db" ]; then
-    store_cached_hash "$cache_db" "$file" "$mtime" "$size" "$result" || true
-  fi
-
-  echo "$result|$file"
-  exit 0
 }
 
 # ---------------------------
@@ -245,7 +244,6 @@ find_duplicates_main() {
   info "Found $total media files. Starting hashing with $jobs jobs..."
 
   # prepare temp and output
-  local global_tmp
   global_tmp=$(mktemp -d "${CACHE_DIR}/global.XXXX")
   local output="${global_tmp}/hashes.txt"; : > "$output"
   trap 'rm -rf "$global_tmp"' EXIT
@@ -265,6 +263,12 @@ find_duplicates_main() {
     fi
   done < "$output"
 
+  local total_groups=${#groups[@]}
+  local processed_groups=0
+  if [ "$total_groups" -gt 0 ]; then
+    progress_tick 0 "$total_groups" "Organizing duplicate groups"
+  fi
+
   # Save a JSON-ish results file for dashboard/TUI
   local results_json="${CACHE_DIR}/last_scan.json"
   if [ -f "$results_json" ]; then
@@ -280,6 +284,9 @@ find_duplicates_main() {
   local total_reclaim=0
 
   for h in "${!groups[@]}"; do
+    processed_groups=$((processed_groups+1))
+    progress_tick "$processed_groups" "$total_groups" "Organizing duplicate groups"
+
     # split newline-delimited paths into an array
     mapfile -t arr < <(printf '%s\n' "${groups[$h]}")
     if [ "${#arr[@]}" -gt 1 ]; then
@@ -358,8 +365,11 @@ find_duplicates_main() {
     fi
   done
 
+  if [ "$total_groups" -gt 0 ]; then
+    printf "\rOrganizing duplicate groups complete (%d/%d)\n" "$processed_groups" "$total_groups" >&2
+  fi
+
   # runtime summary
-  echo
   echo "Scan complete: found $group_count duplicate groups"
   reclaim_human=$(gnumfmt --to=iec --suffix=B "$total_reclaim" 2>/dev/null || true)
   echo "Estimated recoverable: $reclaim_human"
