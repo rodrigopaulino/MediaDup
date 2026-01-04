@@ -23,6 +23,8 @@ PROG="$(basename "$0")"
 CACHE_DIR="${HOME}/.cache/mediadup"
 DEFAULT_CACHE_DB="${HOME}/.mediadup_cache.db"
 SKIPPED_LOG="${CACHE_DIR}/skipped_inputs.log"
+DEBUG="${MEDIADUP_DEBUG:-0}"
+LAST_NORMALIZER_ERR=""
 
 mkdir -p "$CACHE_DIR"
 
@@ -32,10 +34,22 @@ mkdir -p "$CACHE_DIR"
 err() { echo "ERROR: $*" >&2; }
 info() { echo "$*"; }
 cpu_count() { sysctl -n hw.ncpu; }
+format_debug_payload() {
+  printf "%s" "$*" | tr '\n\r\t' '   '
+}
+
 log_skipped_input() {
-  # reason, path
-  local reason="$1"; local path="$2"
-  printf "%s\t%s\t%s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$reason" "$path" >> "$SKIPPED_LOG"
+  # reason, path, [detail]
+  local reason="$1"; local path="$2"; local extra="${3:-}"
+  local stamp
+  stamp="$(date +'%Y-%m-%d %H:%M:%S')"
+  if [ "$DEBUG" -eq 1 ] && [ -n "$extra" ]; then
+    local cleaned
+    cleaned=$(format_debug_payload "$extra")
+    printf "%s\t%s\t%s\t%s\n" "$stamp" "$reason" "$path" "$cleaned" >> "$SKIPPED_LOG"
+  else
+    printf "%s\t%s\t%s\n" "$stamp" "$reason" "$path" >> "$SKIPPED_LOG"
+  fi
 }
 abs_path() {
   local target="$1";
@@ -113,31 +127,129 @@ hash_file() {
 normalize_raster() {
   # args: infile outfile
   local infile="$1"; local outfile="$2"
-  exiftool -q -q -all= -o "$outfile" "$infile"
+  LAST_NORMALIZER_ERR=""
+  local err_file err_msgs=()
+
+  err_file=$(mktemp "${CACHE_DIR}/norm.XXXX")
+  if exiftool -q -q -all= -o "$outfile" "$infile" 2>"$err_file"; then
+    rm -f "$err_file"
+    return 0
+  fi
+  err_msgs+=("exiftool:$(format_debug_payload "$(cat "$err_file")")")
+  rm -f "$err_file"
+
+  # Some assets are mislabeled (extension ≠ file signature). Try ImageMagick
+  # to sniff the true format and re-emit metadata-free bytes.
+  local magick_cmd=""; local -a identify_cmd=()
+  if command -v magick >/dev/null 2>&1; then
+    magick_cmd="magick"
+    identify_cmd=(magick identify)
+  elif command -v convert >/dev/null 2>&1; then
+    magick_cmd="convert"
+    if command -v identify >/dev/null 2>&1; then
+      identify_cmd=(identify)
+    fi
+  fi
+
+  if [ -n "$magick_cmd" ]; then
+    local detected_fmt="" fmt_lower=""
+    if [ ${#identify_cmd[@]} -gt 0 ]; then
+      err_file=$(mktemp "${CACHE_DIR}/norm.XXXX")
+      if detected_fmt=$("${identify_cmd[@]}" -quiet -format '%m' "$infile[0]" 2>"$err_file"); then
+        fmt_lower=$(printf '%s' "$detected_fmt" | tr '[:upper:]' '[:lower:]')
+      else
+        err_msgs+=("identify:$(format_debug_payload "$(cat "$err_file")")")
+      fi
+      rm -f "$err_file"
+    fi
+
+    if [ -n "$fmt_lower" ]; then
+      err_file=$(mktemp "${CACHE_DIR}/norm.XXXX")
+      if "$magick_cmd" "$infile[0]" -strip "${fmt_lower}:$outfile" 2>"$err_file"; then
+        rm -f "$err_file"
+        return 0
+      fi
+      err_msgs+=("${magick_cmd}:${fmt_lower}:$(format_debug_payload "$(cat "$err_file")")")
+      rm -f "$err_file"
+    fi
+
+    err_file=$(mktemp "${CACHE_DIR}/norm.XXXX")
+    if "$magick_cmd" "$infile[0]" -strip png:"$outfile" 2>"$err_file"; then
+      rm -f "$err_file"
+      return 0
+    fi
+    err_msgs+=("${magick_cmd}:png:$(format_debug_payload "$(cat "$err_file")")")
+    rm -f "$err_file"
+  fi
+
+  LAST_NORMALIZER_ERR=$(format_debug_payload "${err_msgs[*]}")
+  return 1
 }
 
 normalize_dng_raw() {
   # extract pure linear raw sensor data
   local infile="$1"; local outfile="$2"
-  dcraw -4 -D -c "$infile" > "$outfile"
+  LAST_NORMALIZER_ERR=""
+  local err_file
+  err_file=$(mktemp "${CACHE_DIR}/norm.XXXX")
+  if dcraw -4 -D -c "$infile" > "$outfile" 2>"$err_file"; then
+    rm -f "$err_file"
+    return 0
+  fi
+  LAST_NORMALIZER_ERR=$(format_debug_payload "dcraw:$(cat "$err_file")")
+  rm -f "$err_file"
+  return 1
 }
 
 normalize_video_streams() {
   # args: infile outprefix
   local infile="$1"; local out="$2"
-  ffmpeg -y -v error -i "$infile" -map 0:v:0 -c copy -f data "${out}_video.bin" 2>/dev/null || true
-  ffmpeg -y -v error -i "$infile" -map 0:a:0 -c copy -f data "${out}_audio.bin" 2>/dev/null || true
+  LAST_NORMALIZER_ERR=""
+  local err_file err_msgs=()
+
+  err_file=$(mktemp "${CACHE_DIR}/norm.XXXX")
+  if ffmpeg -y -v error -i "$infile" -map 0:v:0 -c copy -f data "${out}_video.bin" 2>"$err_file"; then
+    rm -f "$err_file"
+  else
+    err_msgs+=("ffmpeg-video:$(format_debug_payload "$(cat "$err_file")")")
+    rm -f "$err_file"
+    rm -f "${out}_video.bin"
+  fi
+
+  err_file=$(mktemp "${CACHE_DIR}/norm.XXXX")
+  if ffmpeg -y -v error -i "$infile" -map 0:a:0 -c copy -f data "${out}_audio.bin" 2>"$err_file"; then
+    rm -f "$err_file"
+  else
+    err_msgs+=("ffmpeg-audio:$(format_debug_payload "$(cat "$err_file")")")
+    rm -f "$err_file"
+    rm -f "${out}_audio.bin"
+  fi
+
+  if [ ${#err_msgs[@]} -gt 0 ]; then
+    LAST_NORMALIZER_ERR=$(format_debug_payload "${err_msgs[*]}")
+  else
+    LAST_NORMALIZER_ERR=""
+  fi
 }
 
 compute_normalized_hash() {
   # prints a single-line hash for a file (or special tag)
   local file="$1"
+  LAST_NORMALIZER_ERR=""
   if [ ! -f "$file" ]; then
     if [ -e "$file" ]; then
-      log_skipped_input "not-regular-file" "$file"
+      log_skipped_input "not-regular-file" "$file" "$LAST_NORMALIZER_ERR"
     else
-      log_skipped_input "missing-file" "$file"
+      log_skipped_input "missing-file" "$file" "$LAST_NORMALIZER_ERR"
     fi
+    exit 2
+  fi
+  if [ ! -r "$file" ]; then
+    log_skipped_input "unreadable-file" "$file" "permission-denied"
+    exit 2
+  fi
+  if [ ! -s "$file" ]; then
+    log_skipped_input "zero-byte-file" "$file" "empty-input"
     exit 2
   fi
   local e=$(ext "$file")
@@ -146,12 +258,20 @@ compute_normalized_hash() {
 
   case "$e" in
     png|gif|jpg|jpeg)
-      normalize_raster "$file" "$tmpd/norm.img"
-      hash_file "$tmpd/norm.img"
+      if normalize_raster "$file" "$tmpd/norm.img"; then
+        hash_file "$tmpd/norm.img"
+      else
+        log_skipped_input "normalize-raster-failed" "$file" "$LAST_NORMALIZER_ERR"
+        exit 2
+      fi
       ;;
     dng)
-      normalize_raster "$file" "$tmpd/norm.raw"
-      hash_file "$tmpd/norm.raw"
+      if normalize_raster "$file" "$tmpd/norm.raw"; then
+        hash_file "$tmpd/norm.raw"
+      else
+        log_skipped_input "normalize-dng-failed" "$file" "$LAST_NORMALIZER_ERR"
+        exit 2
+      fi
       ;;
     mp4|mov)
       normalize_video_streams "$file" "$tmpd/stream"
@@ -162,13 +282,14 @@ compute_normalized_hash() {
         ha=$(hash_file "$tmpd/stream_audio.bin")
       else ha="NOAUDIO"; fi
       if [ "$hv" = "NOVIDEO" ] && [ "$ha" = "NOAUDIO" ]; then
-        log_skipped_input "video-no-streams" "$file"
+        log_skipped_input "video-no-streams" "$file" "$LAST_NORMALIZER_ERR"
         exit 2
       fi
+      LAST_NORMALIZER_ERR=""
       echo "${hv}-${ha}"
       ;;
     *)
-      log_skipped_input "unsupported-extension:${e:-unknown}" "$file"
+      log_skipped_input "unsupported-extension:${e:-unknown}" "$file" "$LAST_NORMALIZER_ERR"
       exit 2
       ;;
   esac
@@ -420,14 +541,31 @@ compare_hashes_cmd() {
 # ---------------------------
 # Command dispatch
 # ---------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --debug)
+      DEBUG=1
+      export MEDIADUP_DEBUG=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 if [ $# -lt 1 ]; then
   cat <<EOF
 $PROG — media dedupe tool (complete)
 Usage:
-  $PROG find-duplicates <path> [--cache-db PATH] [--jobs N] [--action print|hardlink|symlink|move|none] [--trash-dir PATH]
-  $PROG compare <file1> <file2>
-  $PROG compare-pixels <file1> <file2>
-  $PROG hash <file>
+  $PROG [--debug] find-duplicates <path> [--cache-db PATH] [--jobs N] [--action print|hardlink|symlink|move|none] [--trash-dir PATH]
+  $PROG [--debug] compare <file1> <file2>
+  $PROG [--debug] compare-pixels <file1> <file2>
+  $PROG [--debug] hash <file>
 EOF
   exit 1
 fi
